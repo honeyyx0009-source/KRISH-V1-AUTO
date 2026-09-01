@@ -1,4 +1,4 @@
-; KRISH V1 AUTO - default gold preset (XAUUSD, M15)
+; KRISH V1 AUTO v2 - default gold preset (XAUUSD, M15)
 ; MT5 -> Expert properties -> Load
 InpMagic=260901
 InpEnableTrading=true
@@ -30,17 +30,20 @@ InpGridStepPoints=800
 InpMaxLayers=8
 InpUseProtectionLeg=true
 InpProtectOffsetPoints=80
-InpLegUseTrail=true
-InpLegTrailStartPoints=200
+InpLegLotMode=0
+InpLegUseTrail=false
+InpLegTrailStartPoints=300
 InpLegTrailDistPoints=250
 InpLegTrailStepPoints=100
 InpLegFixedSLPoints=0
 InpLegFixedTPPoints=0
-InpBasketTargetMoney=0
+InpGroupTPMode=0
+InpGroupTargetMoney=0
 InpAutoTargetPoints=300
-InpTargetGrowthPerLayer=0
+InpGroupTPPoints=200
 InpPlaceHardTP=true
 InpShowTPLine=true
+InpMaxTotalLot=0
 InpMaxBasketLossMoney=0
 InpEquityStopPct=0
 InpUseSessionFilter=false
