@@ -95,6 +95,44 @@ TP   = wavg + dir × (target − group_swap) / (valuePerPricePerLot × Σlot)
 - Dono mode me TP **hamesha** weighted average se profit wali side pe hota hai → group loss me band nahi hoga.
 - Grid side pe real (hard) TP order bhi lagta hai (`InpPlaceHardTP`), kyunki group single-direction hai to price exact valid hoti hai. Isliye terminal band ho jaye to bhi grid side ka TP broker ke paas rehta hai.
 
+## 3b. Naked side ka problem aur uska solution
+
+**Problem:** grid side (jaise BUY) ka TP hit hota hai to sab BUY profit me band ho jaate hain, par jo SELL legs bache wo us waqt loss me hote hain aur **bilkul unprotected (naked)** ho jaate hain. Uske baad agla SELL layer 800 point door hota hai, to utni door tak koi protection nahi.
+
+Asli numbers (8 layer buy grid, 100% hedge, gold):
+
+| | value |
+|---|---|
+| BUY total / SELL total | 0.43 / 0.43 (net 0.00) |
+| BUY group TP price | 1957.26 (buy group = +$3) |
+| us price pe SELL side | **−$45.40** (naked bach jaata hai) |
+| poora basket us waqt | −$42.40 = saare 80-point locks ka jod |
+| naked SELL ka bleed | **$43 per 100 points** → 800 pt window me **~$344** |
+| poore basket ka TP | **kabhi nahi** — net 0 hai to PnL frozen hai |
+
+Do baat clear hoti hai:
+
+1. Jo loss "transfer" hota hai wo aapke socha hua $500 nahi, wo hai **locked offset loss** (~$42) — kyunki har layer aur uska leg sirf 80 point ke gap pe lock hote hain. SELL ka +$731 profit upar aate-aate khud hi khatam ho jaata hai, wahi to uska kaam tha.
+2. **Asli khatra** ye hai ki flip ke baad 0.43 lot bilkul naked hai aur 800 point tak koi cover nahi — aur ye tab hota hai jab market ne upar jaana prove kar diya hai.
+3. **Root cause:** 100% hedge me net lot = 0, matlab poore basket ka PnL **frozen** hai (−$42 pe chipka hua). Isliye bot ke paas kamane ka koi rasta hi nahi bachta — ek side naked karna hi padta hai. Ye code ka bug nahi, 100% hedge ka mathematical natija hai.
+
+**3 lever diye gaye hain (`6b` input group):**
+
+| Lever | Input | Kya karta hai |
+|---|---|---|
+| 1. Flip guard | `InpFlipProtectPoints` = 200, `InpFlipGuardPct` = 100 | Flip ke turant baad naked side ke against 200 point pe protection order lag jaata hai (800 ka wait nahi). Unprotected window $344 → **~$86** |
+| 2. Smart flip gate | `InpExitMode` = `EXIT_SMART`, `InpMaxNakedLossMoney` | Flip se **pehle hi** calculate hota hai ki naked side kitne loss me chhutega. Limit se zyada hua to flip **block** ho jaata hai (hard TP bhi hata diya jaata hai) aur bot poore basket ke TP ka intezaar karta hai |
+| 3. Hedge % (root fix) | `InpLegHedgePct` = 100 → **70-80 recommended** | Leg lot grid total ka 70-80% → net exposure bacha rehta hai → basket frozen nahi hota → **dono side ek sath profit me band ho sakte hain, naked kabhi nahi** |
+
+80% hedge ke numbers: net +0.09 lot, poore basket ka TP = 1960.07 (group TP se sirf ~280 point aage) → **ek hi baar me sab band, koi naked side nahi**. Cost: drawdown ka 20% uncovered rehta hai.
+
+`InpExitMode`:
+- `EXIT_SMART` (default) — pehle poora basket close karne ki koshish; flip sirf tab jab sasta ho, ya jab basket frozen ho (tab flip hi ek rasta hai, isliye block nahi hota — deadlock nahi hoga)
+- `EXIT_GROUP_FLIP` — purana v2 behaviour (hamesha flip)
+- `EXIT_BASKET` — flip kabhi nahi, sirf dono side ek sath (**iske sath `InpLegHedgePct` 100 se kam rakhna zaroori hai**, warna kuch band nahi hoga)
+
+Panel me ye live dikhta hai: `net lot`, `BASKET FROZEN` warning, `flip: ALLOWED / BLOCKED`, `cost if it fires now`, aur `basket TP` (aqua line).
+
 ## 4. Prediction engine ke factors
 
 | Factor | Kya dekhta hai |
@@ -133,6 +171,12 @@ ADX se **regime weight** banta hai: ADX high → trend factors bhaari, ADX low �
 | `InpGroupTargetMoney` / `InpAutoTargetPoints` | 0 / 300 | Group ka profit target |
 | `InpGroupTPPoints` | 200 | Points mode me weighted avg se distance |
 | `InpLegUseTrail` | false | Legs ko trail karna (hedge todta hai) |
+| `InpExitMode` | SMART | Basket-first / always-flip / never-flip |
+| `InpLegHedgePct` | 100 | Leg lot = grid total ka itna % (70–80 recommended) |
+| `InpBasketTargetMoney` | 0 | Poore basket ka target (0 = group target jitna) |
+| `InpMaxNakedLossMoney` | 0 | Flip se itna loss naked chhoot sakta hai (0 = 3× target) |
+| `InpFlipProtectPoints` | 200 | Flip ke baad naked side itne point pe cover ho jaata hai |
+| `InpFlipGuardPct` | 100 | Guard leg = naked total ka itna % |
 | `InpMaxTotalLot` | 0 | Total lot itna hone par naye layer band (0 = off) |
 | `InpMaxBasketLossMoney` | 0 | Cycle loss cap (money), 0 = off |
 | `InpEquityStopPct` | 0 | Equity itna % gira to sab band + EA halt |
@@ -142,6 +186,7 @@ ADX se **regime weight** banta hai: ADX high → trend factors bhaari, ADX low �
 ## 6. Zaroori baatein / risk
 
 - **TP shift hone par exposure badhta hai.** BALANCE mode me jab grid side close hota hai to opposite side ka total cover karne ke liye next protection leg bada hota hai. Example: 0.01 → 0.02/0.03 → 0.03/0.03 … TP shift ke baad naya leg 0.10 tak ja sakta hai. `InpMaxTotalLot`, `InpMaxLot`, `InpMaxLayers` aur `InpEquityStopPct` se limit lagana zaroori hai.
+- **100% hedge = frozen basket.** Section 3b padhein: 100% pe poore basket ka PnL hil hi nahi sakta, isliye ek side naked karna majboori ban jaata hai. Safe machine chahiye to `InpLegHedgePct` 70–80 karein aur `InpExitMode = EXIT_SMART` rakhein.
 - 0.01 base ke liye kam se kam **$300–500** balance rakhein (BALANCE leg mode me thoda zyada rakhna behtar).
 - **Hedging account chahiye** (protection leg opposite direction me hota hai). Netting account pe ye logic kaam nahi karega.
 - Market ke neeche BUY = MT5 me **BUY LIMIT** (stop nahi). EA khud sahi type (STOP/LIMIT) choose karta hai, logic aapka wahi rehta hai.

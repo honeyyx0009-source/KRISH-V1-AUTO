@@ -54,6 +54,13 @@ enum ENUM_GTPMODE
    GTP_POINTS=1        // Points beyond the group weighted average
   };
 
+enum ENUM_EXITMODE
+  {
+   EXIT_SMART=0,       // Smart: whole basket first, flip only when cheap or unavoidable
+   EXIT_GROUP_FLIP=1,  // Always flip the TP side (v2 behaviour)
+   EXIT_BASKET=2       // Never flip: only close both sides together
+  };
+
 //==================================================================
 //  I N P U T S
 //==================================================================
@@ -111,6 +118,14 @@ input double  InpAutoTargetPoints       = 300;      // Auto target: points on ba
 input double  InpGroupTPPoints          = 200;      // Points mode: pts beyond weighted average
 input bool    InpPlaceHardTP            = true;     // Put a real TP order on the grid side
 input bool    InpShowTPLine             = true;     // Draw TP / level lines
+
+input group "===== 6b. NAKED SIDE PROTECTION (flip safety) ====="
+input ENUM_EXITMODE InpExitMode         = EXIT_SMART; // How a cycle is allowed to exit
+input double  InpLegHedgePct            = 100;      // Leg lot = this % of the grid side total
+input double  InpBasketTargetMoney      = 0;        // Whole basket target (0 = same as group target)
+input double  InpMaxNakedLossMoney      = 0;        // Max loss left naked by a flip (0 = 3x target)
+input double  InpFlipProtectPoints      = 200;      // Re-cover a naked side within these points
+input double  InpFlipGuardPct           = 100;      // Guard leg lot = this % of the naked total
 
 input group "===== 7. SAFETY ====="
 input double  InpMaxTotalLot            = 0;        // Stop adding above this total lot (0 = off)
@@ -980,12 +995,14 @@ double LegLotFor(const double layerLot,const bool layerAlreadyOpen)
   {
    int ai=DI(g_gridDir), oi=DI(-g_gridDir);
    double activeTotal=g_gLot[ai]+(layerAlreadyOpen?0.0:layerLot);
+   double pct=InpLegHedgePct/100.0;
+   if(pct<=0.0) pct=1.0;
    double lot;
    switch(InpLegLotMode)
      {
-      case LEGLOT_FULL:  lot=activeTotal;                 break;
-      case LEGLOT_LAYER: lot=layerLot;                    break;
-      default:           lot=activeTotal-g_gLot[oi];      break;  // BALANCE
+      case LEGLOT_FULL:  lot=activeTotal*pct;                break;
+      case LEGLOT_LAYER: lot=layerLot;                       break;
+      default:           lot=activeTotal*pct-g_gLot[oi];     break;  // BALANCE
      }
    if(lot<g_lotMin) lot=g_lotMin;
    return(NormLot(lot));
@@ -1122,6 +1139,78 @@ double GroupTPPrice(const int gi,const int dir,const double target)
    return(NormPrice(wavg+dir*(need/(g_vpu*g_gLot[gi]))));
   }
 
+//------------------------------------------------------------------
+//  WHOLE BASKET EXIT (both sides together, nothing is left naked)
+//------------------------------------------------------------------
+double BasketTargetMoney()
+  {
+   double t=InpBasketTargetMoney;
+   if(t<=0.0) t=InpGroupTargetMoney;
+   if(t<=0.0) t=P2P(InpAutoTargetPoints)*InpBaseLot*g_vpu;
+   return(t);
+  }
+
+//--- price where floating(all) + realized == target. 0 if the basket is hedged flat
+double BasketTPPrice(const double target)
+  {
+   double net=g_gLot[0]-g_gLot[1];
+   if(MathAbs(net)<g_lotMin*0.5) return(0.0);          // fully hedged -> PnL is frozen
+   double w   =g_gW[0]-g_gW[1];
+   double swap=g_gSwap[0]+g_gSwap[1];
+   return(NormPrice((w+(target-g_realized-swap)/g_vpu)/net));
+  }
+
+bool BasketFrozen()
+  {
+   double net=MathAbs(g_gLot[0]-g_gLot[1]);
+   double big=MathMax(g_gLot[0],g_gLot[1]);
+   if(big<=0.0) return(false);
+   return(net<big*0.10 || net<g_lotMin*0.5);
+  }
+
+//--- money the opposite (soon to be naked) side will show at 'price'
+double SideMoneyAtPrice(const int gi,const double price)
+  {
+   if(g_gn[gi]==0) return(0.0);
+   int d=(gi==0?1:-1);
+   return((price*g_gLot[gi]-g_gW[gi])*d*g_vpu+g_gSwap[gi]);
+  }
+
+double g_flipCost=0;
+bool   g_flipAllowed=true;
+double g_basketTP=0;
+
+bool FlipAllowed(const int ai,const int oi,const double tpPrice)
+  {
+   g_flipCost=(tpPrice>0.0?SideMoneyAtPrice(oi,tpPrice):0.0);
+
+   if(InpExitMode==EXIT_GROUP_FLIP) return(true);
+   if(g_gn[oi]==0)                  return(true);   // nothing is left behind
+   if(InpExitMode==EXIT_BASKET)     return(false);
+
+   //--- SMART: a fully hedged basket can never reach a basket target,
+   //--- so there the flip is the only way out and must stay allowed.
+   if(BasketFrozen()) return(true);
+
+   double limit=InpMaxNakedLossMoney;
+   if(limit<=0.0) limit=3.0*GroupTargetMoney(ai);
+   return(g_flipCost>=-limit);
+  }
+
+void ManageBasketExit()
+  {
+   if(InpExitMode==EXIT_GROUP_FLIP) return;
+   if(g_nPos==0) return;
+   double target=BasketTargetMoney();
+   g_basketTP=BasketTPPrice(target);
+   double money=g_totalFloat+g_realized;
+   if(money>=target)
+     {
+      DeleteAllOurPendings("whole basket target");
+      CloseAllPositions(StringFormat("whole basket closed in profit: %.2f >= %.2f",money,target));
+     }
+  }
+
 void ManageGroupTP()
   {
    int A=g_gridDir;
@@ -1129,19 +1218,22 @@ void ManageGroupTP()
    int ai=DI(A), oi=DI(-A);
    if(g_gn[ai]==0) return;
 
-   double target=GroupTargetMoney(ai);
+   double target =GroupTargetMoney(ai);
+   double tpPrice=GroupTPPrice(ai,A,target);
+   g_flipAllowed =FlipAllowed(ai,oi,tpPrice);
 
    //--- the whole grid side closes together, in profit, never in loss
-   if(g_gProfit[ai]>=target)
+   if(g_flipAllowed && g_gProfit[ai]>=target)
      {
       DeleteAllOurPendings("grid side reached its weighted TP");
-      CloseDirection(A,StringFormat("%s group weighted TP: %.2f >= %.2f",
-                                    DirName(A),g_gProfit[ai],target));
+      CloseDirection(A,StringFormat("%s group weighted TP: %.2f >= %.2f (naked cost %.2f)",
+                                    DirName(A),g_gProfit[ai],target,g_flipCost));
       return;
      }
 
-   double tpPrice=GroupTPPrice(ai,A,target);
-   bool hard=(InpPlaceHardTP && tpPrice>0.0);
+   //--- flip would leave too much loss naked -> pull the hard TP and let the
+   //--- whole basket exit do the job instead
+   bool hard=(InpPlaceHardTP && g_flipAllowed && tpPrice>0.0);
 
    for(int k=0;k<g_gn[ai];k++)
       ModifyTP(g_pos[g_gpIdx[ai][k]],hard?tpPrice:0.0);
@@ -1150,6 +1242,39 @@ void ManageGroupTP()
    if(InpLegFixedTPPoints<=0.0)
       for(int k=0;k<g_gn[oi];k++)
          ModifyTP(g_pos[g_gpIdx[oi][k]],0.0);
+  }
+
+//------------------------------------------------------------------
+//  FLIP GUARD: a naked grid side is re-covered close to price
+//  instead of waiting a full grid step for the next layer/leg pair
+//------------------------------------------------------------------
+void EnsureFlipGuard()
+  {
+   if(!InpUseProtectionLeg || InpFlipProtectPoints<=0.0) return;
+   if(!g_gridEngaged) return;
+   int A=g_gridDir;
+   if(A==0) return;
+   int ai=DI(A), oi=DI(-A);
+   if(g_gn[ai]==0) return;
+   if(g_gn[oi]>0 || g_gqn[oi]>0) return;      // already covered, or cover is armed
+   if(g_gProfit[ai]>=0.0) return;             // grid side is not losing -> no need
+
+   double pct=InpFlipGuardPct/100.0;
+   if(pct<=0.0) pct=1.0;
+   double lot=NormLot(g_gLot[ai]*pct);
+   double price=ClosePriceFor(A)-A*P2P(InpFlipProtectPoints);
+
+   double sl=0.0,tp=0.0;
+   int O=-A;
+   if(InpLegFixedSLPoints>0.0) sl=price-O*P2P(InpLegFixedSLPoints);
+   if(InpLegFixedTPPoints>0.0) tp=price+O*P2P(InpLegFixedTPPoints);
+
+   if(PricePassedAgainst(price,A))
+     {
+      if(MktTryOk()) OpenMarket(O,lot,g_magLeg,"KV1-GUARD",sl,tp);
+      return;
+     }
+   PlacePending(O,price,lot,g_magLeg,"KV1-GUARD",sl,tp);
   }
 
 //==================================================================
@@ -1181,9 +1306,11 @@ void HandleGrid()
       if(g_pos[i].role!=ROLE_LEG && g_pos[i].sl!=0.0)
          trade.PositionModify(g_pos[i].ticket,0.0,g_pos[i].tp);
 
+   EnsureFlipGuard();      // naked side gets covered close to price
    EnsureGridStructure();
    ManageLegTrail();
-   ManageGroupTP();
+   ManageBasketExit();     // best case: both sides close together in profit
+   ManageGroupTP();        // otherwise the grid side closes at its weighted TP
   }
 
 //==================================================================
@@ -1318,6 +1445,8 @@ void DrawPanel()
 
    int A=g_gridDir;
    int ai=(A!=0?DI(A):0);
+   if(g_nPos>0) g_basketTP=BasketTPPrice(BasketTargetMoney());
+   else         g_basketTP=0;
    double target=(A!=0 && g_gn[ai]>0 ? GroupTargetMoney(ai) : 0.0);
    double tpPrice=(A!=0 && g_gn[ai]>0 ? GroupTPPrice(ai,A,target) : 0.0);
 
@@ -1348,8 +1477,17 @@ void DrawPanel()
    s+=StringFormat("money float %.2f + realized %.2f = %.2f\n",
                    g_totalFloat,g_realized,g_totalFloat+g_realized);
    if(g_mode==MODE_GRID)
+     {
+      s+=StringFormat("net lot %+.2f  hedge %.0f%%  %s\n",
+                      g_gLot[0]-g_gLot[1],InpLegHedgePct,
+                      (BasketFrozen()?"BASKET FROZEN (net ~0)":"basket can close together"));
       s+=StringFormat("group TP %s   (needs %.2f on the %s side)\n",
                       (tpPrice>0.0?DoubleToString(tpPrice,g_digits):"-"),target,DirName(A));
+      s+=StringFormat("flip: %s   cost if it fires now %.2f\n",
+                      (g_flipAllowed?"ALLOWED":"BLOCKED (too much naked loss)"),g_flipCost);
+      s+=StringFormat("basket TP %s   target %.2f\n",
+                      (g_basketTP>0.0?DoubleToString(g_basketTP,g_digits):"n/a"),BasketTargetMoney());
+     }
    if(g_mode==MODE_PYRAMID || g_mode==MODE_WAIT)
       s+=StringFormat("pyramid SL %s\n",(slShown>0.0?DoubleToString(slShown,g_digits):"none yet"));
    s+=StringFormat("next add-on %s\n",(nextAddPrice>0.0?DoubleToString(nextAddPrice,g_digits):"-"));
@@ -1364,6 +1502,7 @@ void DrawPanel()
    if(InpShowTPLine)
      {
       DrawLevel("KV1_lvlTP"   ,tpPrice       ,clrDodgerBlue,STYLE_SOLID  ,"group TP");
+      DrawLevel("KV1_lvlBTP" ,(g_mode==MODE_GRID?g_basketTP:0.0),clrAqua,STYLE_SOLID,"whole basket TP");
       DrawLevel("KV1_lvlLayer",nextLayerPrice,clrOrange    ,STYLE_DASH   ,"next layer");
       DrawLevel("KV1_lvlLeg"  ,nextLegPrice  ,clrRed       ,STYLE_DOT    ,"protection leg");
       DrawLevel("KV1_lvlAdd"  ,nextAddPrice  ,clrLime      ,STYLE_DASH   ,"next add-on");
