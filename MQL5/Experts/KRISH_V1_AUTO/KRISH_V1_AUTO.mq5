@@ -124,8 +124,10 @@ input ENUM_EXITMODE InpExitMode         = EXIT_SMART; // How a cycle is allowed 
 input double  InpLegHedgePct            = 100;      // Leg lot = this % of the grid side total
 input double  InpBasketTargetMoney      = 0;        // Whole basket target (0 = same as group target)
 input double  InpMaxNakedLossMoney      = 0;        // Max loss left naked by a flip (0 = 3x target)
-input double  InpFlipProtectPoints      = 200;      // Re-cover a naked side within these points
+input bool    InpGuardSnapToGrid         = true;    // Guard sits on the grid level nearest to price
+input double  InpFlipProtectPoints      = 200;      // Max distance of the guard from price
 input double  InpFlipGuardPct           = 100;      // Guard leg lot = this % of the naked total
+input bool    InpReanchorGridOnGuard     = true;    // Restart the ladder from the guard level
 
 input group "===== 7. SAFETY ====="
 input double  InpMaxTotalLot            = 0;        // Stop adding above this total lot (0 = off)
@@ -181,7 +183,7 @@ TradeRec g_pend[MAXREC];  int g_nPend;
 //--- per direction view (index 0 = long, 1 = short)
 int      g_gpIdx[2][MAXREC]; int g_gn[2];      // position indexes
 int      g_gqIdx[2][MAXREC]; int g_gqn[2];     // pending indexes
-double   g_gLot[2], g_gW[2], g_gProfit[2], g_gSwap[2];
+double   g_gLot[2], g_gW[2], g_gProfit[2], g_gSwap[2], g_gqLot[2];
 double   g_gEdge[2], g_gEdgeLot[2];            // grid edge (extreme against the group)
 
 //--- role counters
@@ -222,8 +224,11 @@ datetime g_sigBar, g_lastEntryBar;
 int hEmaF, hEmaS, hEmaMF, hEmaMS, hEmaBF, hEmaBS;
 int hAdx, hRsi, hMacd, hAtr, hBands, hStoch;
 
+//--- guard level of the running grid generation (0 = none)
+double   g_guardPrice;
+
 //--- terminal global variable names
-string gvCS, gvLS, gvGS, gvGD, gvEN, gvHALT;
+string gvCS, gvLS, gvGS, gvGD, gvEN, gvGP, gvHALT;
 
 //==================================================================
 //  S M A L L   H E L P E R S
@@ -346,12 +351,14 @@ int OnInit()
    gvGS  ="KV1_"+(string)InpMagic+"_GS";
    gvGD  ="KV1_"+(string)InpMagic+"_GD";
    gvEN  ="KV1_"+(string)InpMagic+"_EN";
+   gvGP  ="KV1_"+(string)InpMagic+"_GP";
    gvHALT="KV1_"+(string)InpMagic+"_HALT";
 
    g_cycleStart =(datetime)(long)GlobalVariableGet(gvCS);
    g_layerStep  =(int)GlobalVariableGet(gvLS);
    g_legStep    =(int)GlobalVariableGet(gvGS);
    g_gridDir    =(int)GlobalVariableGet(gvGD);
+   g_guardPrice =GlobalVariableGet(gvGP);
    g_gridEngaged=(GlobalVariableCheck(gvEN) && GlobalVariableGet(gvEN)>0.0);
    g_halted     =(GlobalVariableCheck(gvHALT) && GlobalVariableGet(gvHALT)>0.0);
    g_startBalance=AccountInfoDouble(ACCOUNT_BALANCE);
@@ -414,7 +421,7 @@ void ScanState()
 
    for(int k=0;k<2;k++)
      {
-      g_gn[k]=0; g_gqn[k]=0;
+      g_gn[k]=0; g_gqn[k]=0; g_gqLot[k]=0;
       g_gLot[k]=0; g_gW[k]=0; g_gProfit[k]=0; g_gSwap[k]=0;
       g_gEdge[k]=0; g_gEdgeLot[k]=0;
      }
@@ -507,6 +514,7 @@ void ScanState()
          int d=DI(r.dir);
          g_gqIdx[d][g_gqn[d]]=idx;
          g_gqn[d]++;
+         g_gqLot[d]+=r.lot;
         }
      }
 
@@ -543,6 +551,7 @@ void ScanState()
         {
          //--- the old grid side is gone: start a fresh generation
          g_layerStep=0; g_legStep=0; SaveSteps();
+         SetGuardPrice(0.0);
          DeleteAllOurPendings("TP shifted to the other side");
          PrintFormat("KV1: >>> TP side shifted to %s <<<",DirName(g_gridDir));
         }
@@ -907,6 +916,7 @@ void StartCycle(const bool adopt=false)
       g_layerStep=0; g_legStep=0;
       g_gridDir=g_cycleDir;
       g_gridEngaged=false;
+      SetGuardPrice(0.0);
       PrintFormat("KV1: ===== new cycle started (%s) =====",DirName(g_cycleDir));
      }
    GlobalVariableSet(gvCS,(double)(long)g_cycleStart);
@@ -926,6 +936,7 @@ void EndCycle(const string why)
    g_gridEngaged=false;
    g_realized=0;
    g_lastCycleEnd=TimeCurrent();
+   SetGuardPrice(0.0);
    GlobalVariableDel(gvCS);
    GlobalVariableDel(gvLS);
    GlobalVariableDel(gvGS);
@@ -995,6 +1006,9 @@ double LegLotFor(const double layerLot,const bool layerAlreadyOpen)
   {
    int ai=DI(g_gridDir), oi=DI(-g_gridDir);
    double activeTotal=g_gLot[ai]+(layerAlreadyOpen?0.0:layerLot);
+   //--- cover that is already open OR already armed (guard, older legs) counts,
+   //--- otherwise the next leg would hedge the same lot twice
+   double coverTotal=g_gLot[oi]+g_gqLot[oi];
    double pct=InpLegHedgePct/100.0;
    if(pct<=0.0) pct=1.0;
    double lot;
@@ -1002,7 +1016,7 @@ double LegLotFor(const double layerLot,const bool layerAlreadyOpen)
      {
       case LEGLOT_FULL:  lot=activeTotal*pct;                break;
       case LEGLOT_LAYER: lot=layerLot;                       break;
-      default:           lot=activeTotal*pct-g_gLot[oi];     break;  // BALANCE
+      default:           lot=activeTotal*pct-coverTotal;     break;  // BALANCE
      }
    if(lot<g_lotMin) lot=g_lotMin;
    return(NormLot(lot));
@@ -1060,7 +1074,13 @@ void EnsureGridStructure()
    if(InpMaxTotalLot>0.0 && (g_gLot[0]+g_gLot[1])>=InpMaxTotalLot) return;
 
    double LP;
-   if(g_layerStep<=0 || !InpUseProtectionLeg)
+   if(g_layerStep<=0 && InpReanchorGridOnGuard && g_guardPrice>0.0)
+     {
+      //--- after a TP flip the ladder restarts from the guard level, so the new
+      //--- layer/leg pair sits close to the market instead of a full step away
+      LP=g_guardPrice-A*P2P(InpGridStepPoints);
+     }
+   else if(g_layerStep<=0 || !InpUseProtectionLeg)
       LP=g_gEdge[ai]-A*P2P(InpGridStepPoints);
    else
      {
@@ -1248,9 +1268,43 @@ void ManageGroupTP()
 //  FLIP GUARD: a naked grid side is re-covered close to price
 //  instead of waiting a full grid step for the next layer/leg pair
 //------------------------------------------------------------------
+void SetGuardPrice(const double p)
+  {
+   g_guardPrice=p;
+   if(p>0.0) GlobalVariableSet(gvGP,p);
+   else      GlobalVariableDel(gvGP);
+  }
+
+//--- where the guard order must sit: the grid level of the naked side that is
+//--- nearest to the current price on the side that hurts it, capped so the
+//--- naked side can never bleed more than InpFlipProtectPoints
+double GuardLevel(const int A,const int ai)
+  {
+   double px=ClosePriceFor(A);
+   double cap=(InpFlipProtectPoints>0.0?P2P(InpFlipProtectPoints):0.0);
+   double capped=(cap>0.0?px-A*cap:0.0);
+   double best=0.0;
+
+   if(InpGuardSnapToGrid)
+     {
+      //--- nearest naked side entry that lies on the losing side of it
+      for(int k=0;k<g_gn[ai];k++)
+        {
+         double e=g_pos[g_gpIdx[ai][k]].price;
+         if((e-px)*(-A)<=0.0) continue;                 // not beyond price -> skip
+         if(best==0.0 || MathAbs(e-px)<MathAbs(best-px)) best=e;
+        }
+     }
+
+   if(best==0.0)                            return(capped>0.0?capped:px-A*P2P(200));
+   if(cap>0.0 && MathAbs(best-px)>cap)      return(capped);   // too far -> use the cap
+   return(best);
+  }
+
 void EnsureFlipGuard()
   {
-   if(!InpUseProtectionLeg || InpFlipProtectPoints<=0.0) return;
+   if(!InpUseProtectionLeg) return;
+   if(InpFlipProtectPoints<=0.0 && !InpGuardSnapToGrid) return;
    if(!g_gridEngaged) return;
    int A=g_gridDir;
    if(A==0) return;
@@ -1262,19 +1316,30 @@ void EnsureFlipGuard()
    double pct=InpFlipGuardPct/100.0;
    if(pct<=0.0) pct=1.0;
    double lot=NormLot(g_gLot[ai]*pct);
-   double price=ClosePriceFor(A)-A*P2P(InpFlipProtectPoints);
+   double price=NormPrice(GuardLevel(A,ai));
+
+   //--- remember the level even if the send fails: the ladder is re-anchored here
+   SetGuardPrice(price);
 
    double sl=0.0,tp=0.0;
    int O=-A;
    if(InpLegFixedSLPoints>0.0) sl=price-O*P2P(InpLegFixedSLPoints);
    if(InpLegFixedTPPoints>0.0) tp=price+O*P2P(InpLegFixedTPPoints);
 
-   if(PricePassedAgainst(price,A))
+   //--- level already reached, or too close to be a pending order:
+   //--- freeze the bleeding right now at market
+   if(PricePassedAgainst(price,A) || !PendingPriceOk(O,price))
      {
-      if(MktTryOk()) OpenMarket(O,lot,g_magLeg,"KV1-GUARD",sl,tp);
+      if(MktTryOk())
+        {
+         if(OpenMarket(O,lot,g_magLeg,"KV1-GUARD",sl,tp))
+            PrintFormat("KV1: naked %s side frozen with a %.2f guard at market",DirName(A),lot);
+        }
       return;
      }
-   PlacePending(O,price,lot,g_magLeg,"KV1-GUARD",sl,tp);
+   if(PlacePending(O,price,lot,g_magLeg,"KV1-GUARD",sl,tp))
+      PrintFormat("KV1: guard armed %.0f pts from price (naked %s side, level %s)",
+                  Pts(MathAbs(price-ClosePriceFor(A))),DirName(A),DoubleToString(price,g_digits));
   }
 
 //==================================================================
@@ -1487,6 +1552,9 @@ void DrawPanel()
                       (g_flipAllowed?"ALLOWED":"BLOCKED (too much naked loss)"),g_flipCost);
       s+=StringFormat("basket TP %s   target %.2f\n",
                       (g_basketTP>0.0?DoubleToString(g_basketTP,g_digits):"n/a"),BasketTargetMoney());
+      if(g_guardPrice>0.0)
+         s+=StringFormat("guard level %s (ladder restarts from here)\n",
+                         DoubleToString(g_guardPrice,g_digits));
      }
    if(g_mode==MODE_PYRAMID || g_mode==MODE_WAIT)
       s+=StringFormat("pyramid SL %s\n",(slShown>0.0?DoubleToString(slShown,g_digits):"none yet"));
@@ -1507,6 +1575,7 @@ void DrawPanel()
       DrawLevel("KV1_lvlLeg"  ,nextLegPrice  ,clrRed       ,STYLE_DOT    ,"protection leg");
       DrawLevel("KV1_lvlAdd"  ,nextAddPrice  ,clrLime      ,STYLE_DASH   ,"next add-on");
       DrawLevel("KV1_lvlSL"   ,slShown       ,clrMagenta   ,STYLE_DASHDOT,"trail SL");
+      DrawLevel("KV1_lvlGuard",(g_mode==MODE_GRID?g_guardPrice:0.0),clrYellow,STYLE_DOT,"guard level");
      }
   }
 

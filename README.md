@@ -120,7 +120,7 @@ Do baat clear hoti hai:
 
 | Lever | Input | Kya karta hai |
 |---|---|---|
-| 1. Flip guard | `InpFlipProtectPoints` = 200, `InpFlipGuardPct` = 100 | Flip ke turant baad naked side ke against 200 point pe protection order lag jaata hai (800 ka wait nahi). Unprotected window $344 → **~$86** |
+| 1. Flip guard | `InpGuardSnapToGrid`, `InpFlipProtectPoints` = 200, `InpFlipGuardPct` = 100 | Jaise hi kisi side ka TP hit hota hai aur doosri side naked bachti hai, uska hedge order **market price ke nazdik wale grid level pe shift** ho jaata hai (800 ka wait nahi). Unprotected window $344 → **~$86** |
 | 2. Smart flip gate | `InpExitMode` = `EXIT_SMART`, `InpMaxNakedLossMoney` | Flip se **pehle hi** calculate hota hai ki naked side kitne loss me chhutega. Limit se zyada hua to flip **block** ho jaata hai (hard TP bhi hata diya jaata hai) aur bot poore basket ke TP ka intezaar karta hai |
 | 3. Hedge % (root fix) | `InpLegHedgePct` = 100 → **70-80 recommended** | Leg lot grid total ka 70-80% → net exposure bacha rehta hai → basket frozen nahi hota → **dono side ek sath profit me band ho sakte hain, naked kabhi nahi** |
 
@@ -131,7 +131,32 @@ Do baat clear hoti hai:
 - `EXIT_GROUP_FLIP` — purana v2 behaviour (hamesha flip)
 - `EXIT_BASKET` — flip kabhi nahi, sirf dono side ek sath (**iske sath `InpLegHedgePct` 100 se kam rakhna zaroori hai**, warna kuch band nahi hoga)
 
-Panel me ye live dikhta hai: `net lot`, `BASKET FROZEN` warning, `flip: ALLOWED / BLOCKED`, `cost if it fires now`, aur `basket TP` (aqua line).
+Panel me ye live dikhta hai: `net lot`, `BASKET FROZEN` warning, `flip: ALLOWED / BLOCKED`, `cost if it fires now`, `basket TP` (aqua line) aur `guard level` (yellow line).
+
+### Guard exactly kaise kaam karta hai
+
+BUY ka TP 1957.26 pe hit hua, 0.43 lot SELL naked bacha (−$45):
+
+```
+1. Guard level dhoondha jaata hai: naked SELL side ka jo grid level current
+   price ke sabse nazdik hai aur us side ko nuksan wali taraf hai
+   -> 1964.8 (754 pts door) -> InpFlipProtectPoints=200 ka cap laga
+   -> GUARD = BUY 0.43 @ 1959.26   (price se sirf 200 pts)
+   (agar level already cross ho chuka ho, ya pending ke liye bahut paas ho,
+    to guard turant MARKET pe khul jaata hai - bleeding abhi ki abhi band)
+
+2. Bleeding freeze: guard tak max $86 (pehle 800 pt window me $344 tha)
+
+3. Ladder guard se dobara start (InpReanchorGridOnGuard):
+   naya SELL layer @ 1967.26 (guard + 800)   lot 0.04
+   uska  BUY  leg  @ 1968.06 (layer + 80)    lot 0.04
+   -> sab fill hone ke baad SELL 0.47 / BUY 0.47 = balanced
+
+4. Market against gaya to wahi normal grid + hedge chain upar chalti rehti hai.
+   Market wapas aaya to SELL group apne weighted TP pe profit me band.
+```
+
+Guard pending ka lot ab leg-lot calculation me **count** hota hai, isliye agla leg dobara wahi lot hedge nahi karta (double hedge ka bug nahi hoga).
 
 ## 4. Prediction engine ke factors
 
@@ -175,8 +200,10 @@ ADX se **regime weight** banta hai: ADX high → trend factors bhaari, ADX low �
 | `InpLegHedgePct` | 100 | Leg lot = grid total ka itna % (70–80 recommended) |
 | `InpBasketTargetMoney` | 0 | Poore basket ka target (0 = group target jitna) |
 | `InpMaxNakedLossMoney` | 0 | Flip se itna loss naked chhoot sakta hai (0 = 3× target) |
-| `InpFlipProtectPoints` | 200 | Flip ke baad naked side itne point pe cover ho jaata hai |
-| `InpFlipGuardPct` | 100 | Guard leg = naked total ka itna % |
+| `InpGuardSnapToGrid` | true | Guard price ke nazdik wale grid level pe baithta hai |
+| `InpFlipProtectPoints` | 200 | Guard price se maximum itni door (bleed cap) |
+| `InpFlipGuardPct` | 100 | Guard leg = naked total ka itna % (100 = poora freeze) |
+| `InpReanchorGridOnGuard` | true | Guard ke baad ladder wahi se dobara start |
 | `InpMaxTotalLot` | 0 | Total lot itna hone par naye layer band (0 = off) |
 | `InpMaxBasketLossMoney` | 0 | Cycle loss cap (money), 0 = off |
 | `InpEquityStopPct` | 0 | Equity itna % gira to sab band + EA halt |
